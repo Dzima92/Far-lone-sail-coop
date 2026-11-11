@@ -80,3 +80,5 @@ Build Release; the DLL is copied to `BepInEx\plugins` automatically.
 ## Credits
 
 Made by Dzima92. Not affiliated with Okomotive or Mixtvision.
+
+My contacts discord: milky_way7084
