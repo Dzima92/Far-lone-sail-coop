@@ -29,8 +29,6 @@ fuel and boxes are synced.
 4. **Copy `FarCoopMod.dll`** (from [Releases](../../releases)) into `BepInEx\plugins\`.
 5. Start the game. A co-op panel appears in the top-left corner (F4 shows/hides it).
 
-You do **not** need `cpp2il_out`, Cpp2IL or UnityExplorer.
-
 ## How to play
 
 1. Both players load the **same save / chapter**.
