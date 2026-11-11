@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch FAR: Lone Sails",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "E:\\Games\\FarLoneSails - coop\\farlonesails.exe",
+            "stopAtEntry": false,
+            "cwd": "E:\\Games\\FarLoneSails - coop\\",
+            "preLaunchTask": "build",
+            "postDebugTask": "kill-game"
+        }
+    ]
+}
