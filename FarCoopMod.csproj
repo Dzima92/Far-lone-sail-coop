@@ -15,8 +15,9 @@
     <Deterministic>true</Deterministic>
     <!-- Game install used for references and auto-deploy -->
     <GameDir>E:\Games\FarLoneSails - coop</GameDir>
-    <!-- Second PC (network share). Copy is skipped with a warning if unreachable. -->
-    <PartnerPluginsDir>\\DESKTOP-ADAM\Users\adam.DESKTOP-ADAM\Desktop\FarLoneSails - coop\BepInEx\plugins</PartnerPluginsDir>
+    <!-- Optional: a second PC's plugins folder (network share) to copy the DLL to.
+         Set it in FarCoopMod.csproj.user (not committed), e.g. <PartnerPluginsDir>\\PC2\share\BepInEx\plugins</PartnerPluginsDir> -->
+    <PartnerPluginsDir Condition="'$(PartnerPluginsDir)' == ''"></PartnerPluginsDir>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>

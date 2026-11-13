@@ -4,8 +4,8 @@ A BepInEx plugin that adds **2-player LAN co-op** to *FAR: Lone Sails*.
 One player hosts, one player joins. Both walk around separately, and the vehicle,
 fuel and boxes are synced.
 
-> **LAN only:** one host plus **one** partner, on the same local network.
-> Internet play and more than 2 players are not supported.
+> **2 players:** one host plus **one** partner, on the same LAN or a virtual LAN
+> (Radmin VPN, Hamachi, ZeroTier). Direct internet play and more than 2 players are not supported.
 
 ## Features
 
@@ -33,7 +33,10 @@ fuel and boxes are synced.
 
 1. Both players load the **same save / chapter**.
 2. Host presses **F1**.
-3. Partner presses **F2** to find the host on the LAN, or clicks the IP field, types the host IP and presses Enter.
+3. Partner presses **F2** to find the host on the LAN, **or** clicks the IP field, types the host address
+   as `IP` or `IP:port` (e.g. `26.12.34.56:7777` for Radmin VPN) and presses Enter.
+   The host's panel shows the addresses to share (`Share: ...`).
+   The panel also has a **server list**: hosts found on the LAN plus your recent servers. Click one to join; **Refresh list** searches again.
 4. Allow the game through Windows Firewall (Private networks) when asked.
    Ports used: TCP 7777, UDP 7778.
 
@@ -44,6 +47,23 @@ fuel and boxes are synced.
 | F3 | Disconnect |
 | F4 | Show / hide co-op panel |
 | F5 | Teleport to partner |
+
+## Playing over Radmin VPN (or Hamachi / ZeroTier)
+
+1. Both players install Radmin VPN and join the same network.
+2. The host presses F1 and reads the `26.x.x.x:7777` address in the panel (the Radmin adapter's IP).
+3. The partner types that address in the IP field and presses Enter. F2 (LAN search) may also work over the VPN.
+
+## Testing with two games on one PC
+
+1. Make a **second copy** of the game folder (each game needs its own `BepInEx` log and config).
+2. Copy `Tools\Test-Host.bat` into the first folder and `Tools\Test-Client.bat` into the second, next to `FarLoneSails.exe`.
+3. Run `Test-Host.bat`, then `Test-Client.bat`. Both start windowed (monitor 1 and 2); the client joins `127.0.0.1:7777` automatically.
+4. Keyboard input goes to the focused window, so click the window you want to control.
+
+Both copies use the same save files: avoid saving in both at once, and back up your save first.
+
+Command-line options (for shortcuts): `-farcoop-host`, `-farcoop-join IP[:port]`, `-farcoop-name Name`.
 
 ## Settings
 
@@ -57,6 +77,8 @@ fuel and boxes are synced.
 | PartnerBody | true | Partner gets a real body (buttons, pushing). Set false if the partner behaves strangely |
 | SendRateHz | 30 | Sync updates per second (minimum 30) |
 | AutoResumeOnStart | true | Skip the RESUME menu once at start |
+| LastHostIp | | Last address used for Join IP (`IP` or `IP:port`) |
+| PositionLog (Debug) | false | Write position diagnostics to the log every 5 s |
 
 ## Troubleshooting
 
@@ -72,7 +94,8 @@ Bug reports: please attach `BepInEx\LogOutput.log` from **both** PCs.
 ## Building from source
 
 Visual Studio 2022+ with .NET Framework 4.7.2. In `FarCoopMod.csproj`, set `GameDir` to your game
-folder (BepInEx must have been run once, so `BepInEx\unhollowed` exists), and clear `PartnerPluginsDir`.
+folder (BepInEx must have been run once, so `BepInEx\unhollowed` exists). Optionally set `PartnerPluginsDir`
+in `FarCoopMod.csproj.user` to also copy the DLL to a second PC.
 Build Release; the DLL is copied to `BepInEx\plugins` automatically.
 
 ## Credits

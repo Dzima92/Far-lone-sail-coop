@@ -81,6 +81,7 @@ namespace FarCoopMod
             if (!Application.runInBackground) Application.runInBackground = true;
             PartnerInput.Depth = 0; // safety: never leak an input override across frames
             PartnerInput.Tick();
+            Guard("cmdline", CommandLineAutomation);
             Guard("hotkeys", HandleHotkeys);
             Guard("net", PumpNetwork);
             Guard("pause", HandlePause);
@@ -116,7 +117,7 @@ namespace FarCoopMod
         private float nextDiag;
         private void Diagnostics()
         {
-            if (!IsConnected || Time.unscaledTime < nextDiag) return;
+            if (!FarCoopPlugin.CfgDebugLog.Value || !IsConnected || Time.unscaledTime < nextDiag) return;
             nextDiag = Time.unscaledTime + 5f;
             var ch = GameAccess.LocalCharacter;
             string me = "none";
@@ -214,7 +215,53 @@ namespace FarCoopMod
             string typed = Input.inputString;
             if (string.IsNullOrEmpty(typed)) return;
             foreach (char c in typed)
-                if ((char.IsDigit(c) || c == '.' || c == ':') && ipField.Length < 21) ipField += c;
+                if ((char.IsLetterOrDigit(c) || c == '.' || c == ':' || c == '-') && ipField.Length < 64) ipField += c;
+        }
+
+        // ======================= command line (testing two games on one PC) =======================
+        //   -farcoop-host                 host as soon as the world is loaded
+        //   -farcoop-join 127.0.0.1:7777  join (retries for 2 minutes while the host starts)
+        //   -farcoop-name Player2         name tag for this game
+        private string cmdJoin;
+        private bool cmdHost, cmdParsed, cmdDone;
+        private float cmdNextTry, cmdGiveUp;
+
+        private void CommandLineAutomation()
+        {
+            if (!cmdParsed)
+            {
+                cmdParsed = true;
+                string[] args = Environment.GetCommandLineArgs();
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string a = args[i].ToLowerInvariant();
+                    if (a == "-farcoop-host") cmdHost = true;
+                    else if (a == "-farcoop-join" && i + 1 < args.Length) cmdJoin = args[++i];
+                    else if (a == "-farcoop-name" && i + 1 < args.Length) overrideName = args[++i];
+                }
+                if (cmdHost || cmdJoin != null) AddLog("Command line: " + (cmdHost ? "auto-host" : "auto-join " + cmdJoin));
+                else cmdDone = true;
+            }
+            if (cmdDone || GameAccess.LocalCharacter == null) return;   // wait for the world
+            if (cmdHost) { StartHost(); cmdDone = true; return; }
+            if (IsConnected) { cmdDone = true; return; }
+            if (cmdGiveUp == 0f) cmdGiveUp = Time.unscaledTime + 120f;
+            if (Time.unscaledTime > cmdGiveUp) { AddLog("Auto-join gave up."); cmdDone = true; return; }
+            if (Time.unscaledTime >= cmdNextTry && !net.Connecting && net.Peer == null)
+            {
+                cmdNextTry = Time.unscaledTime + 10f;
+                JoinIp(cmdJoin);
+            }
+        }
+
+        private string overrideName;
+        private string MyName => string.IsNullOrEmpty(overrideName) ? FarCoopPlugin.CfgPlayerName.Value : overrideName;
+
+        private string MyAddresses()
+        {
+            int port = FarCoopPlugin.CfgPort.Value;
+            var ips = CoopNet.LocalIPv4s();
+            return ips.Count == 0 ? "127.0.0.1:" + port : string.Join("  ", ips.ConvertAll(i => i + ":" + port));
         }
 
         // ======================= actions =======================
@@ -228,10 +275,10 @@ namespace FarCoopMod
 
         public void StartHost()
         {
-            if (IsHost) { AddLog("Already hosting. Partner: press F2 or Join IP " + string.Join(" / ", CoopNet.LocalIPv4s())); return; }
+            if (IsHost) { AddLog("Already hosting. Partner joins with: " + MyAddresses()); return; }
             if (Busy("hosting")) return;
             ResetSession();
-            net.StartHost(FarCoopPlugin.CfgPort.Value, FarCoopPlugin.CfgDiscoveryPort.Value, FarCoopPlugin.CfgPlayerName.Value);
+            net.StartHost(FarCoopPlugin.CfgPort.Value, FarCoopPlugin.CfgDiscoveryPort.Value, MyName);
         }
 
         public void SearchAndJoin()
@@ -240,8 +287,41 @@ namespace FarCoopMod
             if (Busy("searching")) return;
             if (net.Searching) return;
             found.Clear();
+            autoJoinFound = true;
             AddLog("Searching LAN...");
             net.SearchLan(FarCoopPlugin.CfgDiscoveryPort.Value);
+        }
+
+        /// <summary>Fill the server list without joining.</summary>
+        public void RefreshServers(bool quiet = false)
+        {
+            if (net.Searching || IsHost) return;
+            found.Clear();
+            autoJoinFound = false;
+            quietSearch = quiet;
+            if (!quiet) AddLog("Refreshing server list...");
+            net.SearchLan(FarCoopPlugin.CfgDiscoveryPort.Value);
+        }
+
+        private bool autoJoinFound, quietSearch, initialRefreshDone;
+        private string lastJoinAddress;
+
+        private List<string> RecentServers()
+        {
+            var list = new List<string>();
+            foreach (var part in (FarCoopPlugin.CfgRecentServers.Value ?? "").Split('|'))
+                if (part.Trim().Length > 0 && !list.Contains(part.Trim())) list.Add(part.Trim());
+            return list;
+        }
+
+        private void RememberServer(string address)
+        {
+            if (string.IsNullOrEmpty(address)) return;
+            var list = RecentServers();
+            list.Remove(address);
+            list.Insert(0, address);
+            if (list.Count > 5) list.RemoveRange(5, list.Count - 5);
+            FarCoopPlugin.CfgRecentServers.Value = string.Join("|", list);
         }
 
         public void JoinIp(string ip)
@@ -252,8 +332,10 @@ namespace FarCoopMod
             int port = FarCoopPlugin.CfgPort.Value;
             int colon = ip.LastIndexOf(':');
             if (colon > 0 && int.TryParse(ip.Substring(colon + 1), out int p)) { port = p; ip = ip.Substring(0, colon); }
-            FarCoopPlugin.CfgLastHostIp.Value = ip;
+            if (port <= 0 || port > 65535) { AddLog("Port must be 1-65535."); return; }
+            FarCoopPlugin.CfgLastHostIp.Value = port == FarCoopPlugin.CfgPort.Value ? ip : ip + ":" + port;
             ResetSession();
+            lastJoinAddress = ip + ":" + port;
             AddLog($"Connecting to {ip}:{port}...");
             net.Connect(ip, port);
         }
@@ -300,17 +382,31 @@ namespace FarCoopMod
         {
             while (net.Events.TryDequeue(out var ev))
             {
-                if (ev == "#search_none") AddLog("No host found on LAN. Type the host IP and press 'Join IP'.");
+                if (ev == "#search_none") { if (!quietSearch) AddLog("No host found on LAN. Type the host IP:port and press 'Join IP'."); quietSearch = false; }
                 else if (ev == "#connect_failed") ResetSession();
                 else AddLog(ev);
             }
 
             while (net.Discovered.TryDequeue(out var h))
             {
+                // one row per host: a host answers once per network adapter
+                int same = found.FindIndex(f => f.Name == h.Name && f.Port == h.Port);
+                if (same >= 0)
+                {
+                    if (h.Ip == "127.0.0.1") found[same] = h;   // same PC: loopback is the reliable address
+                    continue;
+                }
                 found.Add(h);
-                AddLog($"Found host '{h.Name}' at {h.Ip}:{h.Port}");
-                if (found.Count == 1 && net.Peer == null && !net.Connecting)
+                if (!quietSearch) AddLog($"Found host '{h.Name}' at {h.Ip}:{h.Port}");
+                if (autoJoinFound && found.Count == 1 && net.Peer == null && !net.Connecting)
                     JoinIp(h.Ip + ":" + h.Port);
+            }
+
+            // fill the server list once when the world is loaded (no auto-join)
+            if (!initialRefreshDone && GameAccess.LocalCharacter != null)
+            {
+                initialRefreshDone = true;
+                if (!IsHost && net.Peer == null) RefreshServers(true);
             }
 
             var newPeer = net.PollNewPeer();
@@ -322,7 +418,7 @@ namespace FarCoopMod
                 {
                     var w = Proto.Begin(MsgType.Hello, out var ms);
                     w.Write(FarCoopPlugin.ProtocolVersion);
-                    w.Write(FarCoopPlugin.CfgPlayerName.Value);
+                    w.Write(MyName);
                     w.Write(SceneManager.GetActiveScene().name);
                     newPeer.Send(Proto.End(w, ms));
                 }
@@ -377,7 +473,7 @@ namespace FarCoopMod
                     }
                     var w = Proto.Begin(MsgType.Welcome, out var ms);
                     w.Write(FarCoopPlugin.ProtocolVersion);
-                    w.Write(FarCoopPlugin.CfgPlayerName.Value);
+                    w.Write(MyName);
                     w.Write(SceneManager.GetActiveScene().name);
                     peer.Send(Proto.End(w, ms));
                     handshakeDone = true;
@@ -404,6 +500,7 @@ namespace FarCoopMod
                     handshakeDone = true;
                     vehicle.Scan(true);
                     AddLog($"Joined '{partnerName}'. The host drives the vehicle physics.");
+                    RememberServer(lastJoinAddress);
                     CheckScene();
                     break;
                 }
@@ -536,7 +633,9 @@ namespace FarCoopMod
         {
             const float w = 420f;
             float x = 10f, y = 10f;
-            float h = 24f + 20f + 26f + 34f + 32f + 32f + log.Count * 34f + 8f;
+            var servers = BuildServerRows();
+            float listH = IsConnected || IsHost ? 0f : 24f + servers.Count * 26f + 6f;
+            float h = 24f + 20f + 26f + 34f + 32f + listH + 32f + log.Count * 34f + 8f;
             GUI.Box(new Rect(x, y, w, h), "FAR LAN Co-op " + FarCoopPlugin.Version + "   [F4 hide]");
             float cx = x + 10f, cy = y + 24f, cw = w - 20f;
 
@@ -554,7 +653,7 @@ namespace FarCoopMod
             }
             else
             {
-                GUI.Label(new Rect(cx, cy, cw, 20f), "My IP: " + string.Join(", ", CoopNet.LocalIPv4s()));
+                GUI.Label(new Rect(cx, cy, cw, 20f), (IsHost ? "Share: " : "My IP: ") + MyAddresses());
             }
             cy += 26f;
 
@@ -567,13 +666,26 @@ namespace FarCoopMod
             GUI.Label(new Rect(cx, cy + 4f, 60f, 22f), "Host IP:");
             string fieldText = ipEditing
                 ? ipField + ((Time.unscaledTime % 1f) < 0.5f ? "_" : " ") + "   (Enter = join, Esc = cancel)"
-                : (string.IsNullOrEmpty(ipField) ? "click to type IP" : ipField + "   (click to edit)");
+                : (string.IsNullOrEmpty(ipField) ? "click, type IP:port" : ipField + "   (click to edit)");
             if (GUI.Button(new Rect(cx + 60f, cy, cw - 170f, 24f), fieldText))
             {
                 ipEditing = !ipEditing;
             }
             if (GUI.Button(new Rect(cx + cw - 100f, cy, 100f, 24f), net.Connecting ? "Connecting" : "Join IP")) { ipEditing = false; JoinIp(ipField); }
             cy += 32f;
+
+            if (listH > 0f)
+            {
+                GUI.Label(new Rect(cx, cy + 2f, cw - 130f, 22f), servers.Count == 0 ? "Servers: none found yet" : "Servers (click to join):");
+                if (GUI.Button(new Rect(cx + cw - 120f, cy, 120f, 22f), net.Searching ? "Searching..." : "Refresh list")) RefreshServers();
+                cy += 24f;
+                foreach (var row in servers)
+                {
+                    if (GUI.Button(new Rect(cx, cy, cw, 24f), row.Key)) { ipEditing = false; ipField = row.Value; JoinIp(row.Value); }
+                    cy += 26f;
+                }
+                cy += 6f;
+            }
 
             if (GUI.Button(new Rect(cx, cy, cw, 24f), "Teleport to partner (F5)")) TeleportToPartner();
             cy += 32f;
@@ -585,6 +697,21 @@ namespace FarCoopMod
             }
 
             DrawPartnerTag();
+        }
+
+        /// <summary>LAN hosts found by search + recently joined servers: (label, address).</summary>
+        private List<KeyValuePair<string, string>> BuildServerRows()
+        {
+            var rows = new List<KeyValuePair<string, string>>();
+            var seen = new HashSet<string>();
+            foreach (var f in found)
+            {
+                string addr = f.Ip + ":" + f.Port;
+                if (seen.Add(addr)) rows.Add(new KeyValuePair<string, string>($"{f.Name}   {addr}   (LAN)", addr));
+            }
+            foreach (var addr in RecentServers())
+                if (seen.Add(addr) && rows.Count < 6) rows.Add(new KeyValuePair<string, string>($"{addr}   (recent)", addr));
+            return rows;
         }
 
         private void DrawPartnerTag()

@@ -16,7 +16,10 @@ namespace FarCoopMod
     {
         private static readonly HashSet<string> StripTypes = new HashSet<string>
         {
-            "DataSaverCharacter", "SaveTransform", "AudioListener", "CameraFreeMovement"
+            "DataSaverCharacter", "SaveTransform", "AudioListener", "CameraFreeMovement",
+            // FAR's motion smoothing drives a separate "virtual" body; a second copy of it moved the
+            // LOCAL player's visible body to twice its position (invisible on your own screen)
+            "InterpolationTarget", "InterpolationAgent", "InterpolationUpdater"
         };
 
         public Character Character { get; private set; }

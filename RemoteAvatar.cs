@@ -200,6 +200,52 @@ namespace FarCoopMod
 
         private Vector3 targetRoot;
         private Vector3 rootToVisual;
+        private Vector3 meshOffset = new Vector3(0f, 0.9f, 0f);  // local character: mesh center - root
+        private Vector3 cloneCenterLocal;                        // copy: mesh center in avatar space
+        private Renderer avatarRenderer;
+        private float nextAlign;
+        private bool alignLogged;
+        private int alignLogCount;
+
+        private void UpdateAlignment()
+        {
+            if (Time.unscaledTime < nextAlign) return;
+            nextAlign = Time.unscaledTime + 0.5f;
+            try
+            {
+                var ch = GameAccess.LocalCharacter;
+                Renderer lr = null;
+                try { lr = ch?.meshCharacter; } catch { }
+                if (ch != null && GameAccess.Alive(lr))
+                {
+                    Vector3 off = lr.bounds.center - ch.transform.position;
+                    if (off.sqrMagnitude < 9f) meshOffset = off;
+                }
+                if (GameAccess.Alive(avatarRenderer))
+                {
+                    Vector3 c = root.transform.InverseTransformPoint(avatarRenderer.bounds.center);
+                    if (c.sqrMagnitude < 1e10f) cloneCenterLocal = c;
+                }
+                if (alignLogCount < 4 && GameAccess.Alive(avatarRenderer))
+                {
+                    alignLogCount++;
+                    string orig = "-";
+                    try
+                    {
+                        var ch2 = GameAccess.LocalCharacter;
+                        var mr = ch2.meshCharacter;
+                        orig = $"{mr.name} type={mr.GetIl2CppType().Name} pos={mr.transform.position} bounds={mr.bounds.center}/{mr.bounds.size} layer={mr.gameObject.layer} visible={mr.isVisible} enabled={mr.enabled}";
+                    }
+                    catch (Exception e) { orig = "err " + e.Message; }
+                    var ar = avatarRenderer;
+                    string mine = $"{ar.name} type={ar.GetIl2CppType().Name} pos={ar.transform.position} bounds={ar.bounds.center}/{ar.bounds.size} layer={ar.gameObject.layer} visible={ar.isVisible} enabled={ar.enabled} active={ar.gameObject.activeInHierarchy} root={root.transform.position} scale={ar.transform.lossyScale}";
+                    int rc = 0;
+                    try { rc = model.gameObject.GetComponentsInChildren(Il2CppType.Of<Renderer>(), true).Length; } catch { }
+                    FarCoopPlugin.Logger.LogInfo($"Avatar align: meshOffset={meshOffset} cloneCenterLocal={cloneCenterLocal} renderers={rc}\n  ORIG {orig}\n  COPY {mine}");
+                }
+            }
+            catch { }
+        }
         private Vector3 lookDir;
         private Vector3 rootVelocity;        // where the partner is looking / walking   // measured once on our own character (same model)
         private bool hasRoot;
@@ -242,14 +288,18 @@ namespace FarCoopMod
             }
             // FAR's visual body is interpolated separately and can report odd positions:
             // stand the avatar on the partner's physics root instead.
+            var t = root.transform;
             var rootWorld = PartnerRootWorld(vehicle);
             if (rootWorld.HasValue)
             {
                 float ahead = Mathf.Clamp(Time.time - LastUpdateTime, 0f, 0.1f);
-                worldPos = rootWorld.Value + rootToVisual + rootVelocity * ahead;
+                // FAR's model is skinned far away from its own transform: align the MESH CENTER of
+                // the copy with where the mesh sits on a real character (root + meshOffset).
+                UpdateAlignment();
+                Vector3 desiredCenter = rootWorld.Value + meshOffset + rootVelocity * ahead;
+                worldPos = desiredCenter - t.rotation * cloneCenterLocal;
             }
 
-            var t = root.transform;
             float k = 1f - Mathf.Exp(-25f * dt);
             if ((t.position - worldPos).sqrMagnitude > 25f) t.position = worldPos;
             else t.position = Vector3.Lerp(t.position, worldPos, k);
@@ -332,6 +382,24 @@ namespace FarCoopMod
                         if (rr == null) continue;
                         if (!rr.gameObject.activeSelf) rr.gameObject.SetActive(true);
                         rr.enabled = true;
+                    }
+                }
+                catch { }
+
+                // the biggest renderer of the copy = its body mesh; keep it animating off-screen
+                avatarRenderer = null; alignLogged = false; alignLogCount = 0; nextAlign = 0f; cloneCenterLocal = Vector3.zero;
+                try
+                {
+                    var rs = model.gameObject.GetComponentsInChildren(Il2CppType.Of<Renderer>(), true);
+                    float best = -1f;
+                    for (int i = 0; i < rs.Length; i++)
+                    {
+                        var rr = rs[i]?.TryCast<Renderer>();
+                        if (rr == null) continue;
+                        var smr = rr.TryCast<SkinnedMeshRenderer>();
+                        if (smr != null) smr.updateWhenOffscreen = true;
+                        float size = rr.bounds.size.sqrMagnitude;
+                        if (size > best) { best = size; avatarRenderer = rr; }
                     }
                 }
                 catch { }

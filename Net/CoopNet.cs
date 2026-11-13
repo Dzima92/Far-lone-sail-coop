@@ -134,8 +134,8 @@ namespace FarCoopMod.Net
                 try
                 {
                     var ar = client.BeginConnect(ip, port, null, null);
-                    if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
-                        throw new TimeoutException("no answer in 5s (is the host running and port " + port + " allowed in the firewall?)");
+                    if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(8)))
+                        throw new TimeoutException("no answer in 8s (is the host running, the IP right and port " + port + " allowed in the firewall?)");
                     client.EndConnect(ar);
                     pendingConnections.Enqueue(new Connection(client));
                 }
@@ -162,7 +162,7 @@ namespace FarCoopMod.Net
                         udp.EnableBroadcast = true;
                         udp.Client.ReceiveTimeout = 400;
                         byte[] req = Encoding.UTF8.GetBytes(DiscoverRequest);
-                        var targets = new List<IPAddress> { IPAddress.Broadcast };
+                        var targets = new List<IPAddress> { IPAddress.Broadcast, IPAddress.Loopback };   // loopback: 2 games on one PC
                         targets.AddRange(SubnetBroadcasts());
 
                         DateTime end = DateTime.UtcNow.AddSeconds(3);
@@ -242,8 +242,13 @@ namespace FarCoopMod.Net
 
         // ---------------- helpers ----------------
 
+        private static List<string> ipCache;
+        private static DateTime ipCacheTime;
+
+        /// <summary>Local IPv4 addresses (LAN, Radmin/Hamachi/ZeroTier VPN adapters...). Cached 10 s.</summary>
         public static List<string> LocalIPv4s()
         {
+            if (ipCache != null && (DateTime.UtcNow - ipCacheTime).TotalSeconds < 10) return ipCache;
             var list = new List<string>();
             try
             {
@@ -257,6 +262,8 @@ namespace FarCoopMod.Net
                 }
             }
             catch { }
+            ipCache = list;
+            ipCacheTime = DateTime.UtcNow;
             return list;
         }
 

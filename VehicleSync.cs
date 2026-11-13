@@ -122,19 +122,41 @@ namespace FarCoopMod
             return Proto.End(w, ms);
         }
 
+        // host: what was last sent per body, so resting parts are not re-sent 30x a second
+        private Vector3[] sentPos = new Vector3[0];
+        private Quaternion[] sentRot = new Quaternion[0];
+        private float nextFullState;
+
         public byte[] BuildStateMessage()
         {
-            var w = Proto.Begin(MsgType.VehicleState, out var ms);
-            int count = 0;
-            for (int i = 0; i < Bodies.Count; i++) if (GameAccess.Alive(Bodies[i])) count++;
-            w.Write((ushort)count);
+            if (sentPos.Length != Bodies.Count) { sentPos = new Vector3[Bodies.Count]; sentRot = new Quaternion[Bodies.Count]; nextFullState = 0f; }
+            bool full = Time.unscaledTime >= nextFullState;
+            if (full) nextFullState = Time.unscaledTime + 1f;
+
+            var idx = new List<int>(Bodies.Count);
             for (int i = 0; i < Bodies.Count; i++)
             {
                 var rb = Bodies[i];
                 if (!GameAccess.Alive(rb)) continue;
+                if (full) { idx.Add(i); continue; }
+                Vector3 p = rb.position;
+                bool moved = (p - sentPos[i]).sqrMagnitude > 0.000004f                  // 2 mm
+                             || Quaternion.Angle(rb.rotation, sentRot[i]) > 0.2f
+                             || rb.velocity.sqrMagnitude > 0.0004f                       // still moving
+                             || rb.angularVelocity.sqrMagnitude > 0.0004f;
+                if (moved) idx.Add(i);
+            }
+
+            var w = Proto.Begin(MsgType.VehicleState, out var ms);
+            w.Write((ushort)idx.Count);
+            foreach (int i in idx)
+            {
+                var rb = Bodies[i];
+                Vector3 p = rb.position; Quaternion q = rb.rotation;
+                sentPos[i] = p; sentRot[i] = q;
                 w.Write((ushort)i);
-                w.Write(rb.position);
-                w.Write(rb.rotation);
+                w.Write(p);
+                w.Write(q);
                 w.Write(rb.velocity);
                 w.Write(rb.angularVelocity);
             }
