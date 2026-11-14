@@ -22,6 +22,7 @@ namespace FarCoopMod
             public Rigidbody Body;
             public Vector3 LastPos;
             public Quaternion LastRot;
+            public bool LastLocal;
             public bool Gone;
         }
 
@@ -41,6 +42,8 @@ namespace FarCoopMod
         private List<string> hostKeys = new List<string>();
         private int[] hostToLocal = new int[0];
         private Snap[] snaps = new Snap[0];
+        private PoseBuffer[] bufs = new PoseBuffer[0];
+        private bool[] bufLocal = new bool[0];
         private float snapTime;
         private readonly Dictionary<IntPtr, bool> originalKinematic = new Dictionary<IntPtr, bool>();
 
@@ -170,42 +173,72 @@ namespace FarCoopMod
             return Proto.End(w, ms);
         }
 
-        /// <summary>Items that moved since last send (all of them every 2 s).</summary>
-        public byte[] BuildStateMessage()
+        private static bool InVehicle(Entry e)
+        {
+            try { return e.Item.inVehicle; } catch { return false; }
+        }
+
+        /// <summary>
+        /// Items that moved since last send (all of them every 2 s). Items inside the vehicle are sent
+        /// relative to it: a box resting in a driving vehicle does not move relative to it, so it is not
+        /// re-sent every tick, and the client places it on its own (interpolated) vehicle exactly.
+        /// </summary>
+        public byte[] BuildStateMessage(Rigidbody chassis)
         {
             bool full = Time.unscaledTime >= nextFull;
             if (full) nextFull = Time.unscaledTime + 2f;
+            bool haveFrame = chassis != null && GameAccess.Alive(chassis);
+            Vector3 cp = Vector3.zero; Quaternion cr = Quaternion.identity, cinv = Quaternion.identity;
+            if (haveFrame) { cp = chassis.position; cr = chassis.rotation; cinv = Quaternion.Inverse(cr); }
 
-            var w = Proto.Begin(MsgType.ItemState, out var ms);
             var idxs = new List<int>();
+            var poses = new List<KeyValuePair<Vector3, Quaternion>>();
+            var locals = new List<bool>();
             for (int i = 0; i < local.Count; i++)
             {
                 var e = local[i];
-                if (i == clientIdx && Time.unscaledTime < clientUntil) continue;
-                if (e.Gone || !GameAccess.Alive(e.Item)) { if (full) idxs.Add(i); continue; }
-                var t = e.Item.transform;
-                if (full || (t.position - e.LastPos).sqrMagnitude > 0.0001f || Quaternion.Angle(t.rotation, e.LastRot) > 0.5f)
-                    idxs.Add(i);
+                if (e.Gone || !GameAccess.Alive(e.Item)) { if (full) { idxs.Add(i); poses.Add(default); locals.Add(false); } continue; }
+                Vector3 pos; Quaternion rot;
+                if (e.Body != null) { pos = e.Body.position; rot = e.Body.rotation; }
+                else { var t = e.Item.transform; pos = t.position; rot = t.rotation; }
+                bool loc = haveFrame && InVehicle(e);
+                if (loc) { pos = cinv * (pos - cp); rot = cinv * rot; }
+                if (full || loc != e.LastLocal || (pos - e.LastPos).sqrMagnitude > 0.0001f || Quaternion.Angle(rot, e.LastRot) > 0.5f)
+                {
+                    idxs.Add(i); poses.Add(new KeyValuePair<Vector3, Quaternion>(pos, rot)); locals.Add(loc);
+                }
             }
             if (idxs.Count == 0) return null;
 
+            var w = Proto.Begin(MsgType.ItemState, out var ms);
+            w.Write(Time.realtimeSinceStartup);
             w.Write((ushort)idxs.Count);
-            foreach (int i in idxs)
+            for (int k = 0; k < idxs.Count; k++)
             {
+                int i = idxs[k];
                 var e = local[i];
                 w.Write((ushort)i);
                 bool alive = !e.Gone && GameAccess.Alive(e.Item);
                 byte flags = 0;
                 if (alive) flags |= 1;
                 if (alive) { try { if (e.Item.IsTaken()) flags |= 2; } catch { } }
+                if (locals[k]) flags |= 4;
                 w.Write(flags);
                 if (!alive) continue;
-                var t = e.Item.transform;
-                e.LastPos = t.position; e.LastRot = t.rotation;
-                w.Write(t.position);
-                w.Write(t.rotation);
+                Vector3 pos = poses[k].Key; Quaternion rot = poses[k].Value;
+                e.LastPos = pos; e.LastRot = rot; e.LastLocal = locals[k];
+                w.Write(pos);
+                w.WriteQuatC(rot);
                 Vector3 vel = Vector3.zero;
-                try { if (e.Body != null && !e.Body.isKinematic) vel = e.Body.velocity; } catch { }
+                try
+                {
+                    if (e.Body != null && !e.Body.isKinematic)
+                    {
+                        vel = e.Body.velocity;
+                        if (locals[k]) vel = cinv * (vel - chassis.GetPointVelocity(e.Body.position));
+                    }
+                }
+                catch { }
                 w.Write(vel);
             }
             return Proto.End(w, ms);
@@ -221,30 +254,38 @@ namespace FarCoopMod
             var old = snaps;
             snaps = new Snap[n];
             Array.Copy(old, snaps, Math.Min(old.Length, n));
+            var oldB = bufs; var oldL = bufLocal;
+            bufs = new PoseBuffer[n]; bufLocal = new bool[n];
+            for (int i = 0; i < n; i++) { bufs[i] = i < oldB.Length ? oldB[i] : new PoseBuffer(); bufLocal[i] = i < oldL.Length && oldL[i]; }
             Scan(true);
             RebuildMapping();
         }
 
         public void ReadState(BinaryReader r)
         {
+            float time = r.ReadSingle();
+            NetClock.OnHostTime(time);
             int n = r.ReadUInt16();
             for (int k = 0; k < n; k++)
             {
                 int i = r.ReadUInt16();
                 byte flags = r.ReadByte();
                 var s = new Snap();
+                bool loc = (flags & 4) != 0;
                 if ((flags & 1) != 0)
                 {
                     s.Valid = true;
                     s.Held = (flags & 2) != 0;
                     s.Pos = r.ReadVector3();
-                    s.Rot = r.ReadQuaternion();
+                    s.Rot = r.ReadQuatC();
                     s.Vel = r.ReadVector3();
                 }
                 if (i < snaps.Length)
                 {
                     snaps[i] = s;
-                    if (!s.Valid) HideGone(i);
+                    if (!s.Valid) { HideGone(i); continue; }
+                    if (bufLocal[i] != loc) { bufs[i].Clear(); bufLocal[i] = loc; }
+                    bufs[i].Add(time, s.Pos, s.Rot, s.Vel);
                 }
             }
             snapTime = Time.time;
@@ -273,10 +314,10 @@ namespace FarCoopMod
         }
 
         /// <summary>Client FixedUpdate: mirror host item poses, except what we are carrying.</summary>
-        public void Apply(Item heldLocally)
+        public void Apply(Item heldLocally, VehicleSync vehicle)
         {
             IntPtr held = heldLocally != null ? heldLocally.Pointer : IntPtr.Zero;
-            float age = Mathf.Clamp(Time.time - snapTime, 0f, 0.2f);
+            float rt = NetClock.RenderTime;
 
             // track which item we own
             Entry heldEntry = null;
@@ -303,6 +344,7 @@ namespace FarCoopMod
                 {
                     lastLoggedOwn = heldEntry.Key;
                     FarCoopPlugin.Logger.LogInfo($"Carrying item {heldEntry.Key} (host index {heldHost})");
+                    Telemetry.Event("I took " + heldEntry.Item.name);
                 }
             }
             else if (ownHeld) { ownHeld = false; ownUntil = Time.unscaledTime + OwnGrace; lastLoggedOwn = null; }
@@ -329,20 +371,26 @@ namespace FarCoopMod
                 var rb = e.Body;
                 try
                 {
-                    var s = snaps[h];
-                    Vector3 target = s.Pos + s.Vel * age;
+                    if (h >= bufs.Length || !bufs[h].Sample(rt, out Vector3 target, out Quaternion targetRot)) continue;
+                    if (bufLocal[h])
+                    {
+                        // relative to the vehicle: place it on OUR vehicle's pose of this very step
+                        if (!vehicle.HasFramePose) continue;
+                        target = vehicle.FramePos + vehicle.FrameRot * target;
+                        targetRot = vehicle.FrameRot * targetRot;
+                    }
                     if (rb != null)
                     {
                         if (!originalKinematic.ContainsKey(rb.Pointer)) originalKinematic[rb.Pointer] = rb.isKinematic;
                         if (!rb.isKinematic) rb.isKinematic = true;
-                        if ((rb.position - target).sqrMagnitude > 4f) { rb.position = target; rb.rotation = s.Rot; }
-                        else { rb.MovePosition(Vector3.Lerp(rb.position, target, 0.5f)); rb.MoveRotation(Quaternion.Slerp(rb.rotation, s.Rot, 0.5f)); }
+                        if ((rb.position - target).sqrMagnitude > 4f) { rb.position = target; rb.rotation = targetRot; }
+                        else { rb.MovePosition(target); rb.MoveRotation(targetRot); }
                     }
                     else
                     {
                         var t = e.Item.transform;
-                        t.position = Vector3.Lerp(t.position, target, 0.5f);
-                        t.rotation = Quaternion.Slerp(t.rotation, s.Rot, 0.5f);
+                        t.position = target;
+                        t.rotation = targetRot;
                     }
                 }
                 catch { }
@@ -371,7 +419,29 @@ namespace FarCoopMod
         }
 
         /// <summary>Host: the client carries / dropped an item; follow its pose.</summary>
-        public void ReadHold(BinaryReader r)
+        /// <summary>Host: what one connected player is carrying.</summary>
+        public sealed class HoldState
+        {
+            public int Idx = -1;
+            public float Until;
+            public bool Held;
+            public Character Puppet;
+            public string LastLogged;
+            public bool Active => Idx >= 0 && Held && Time.unscaledTime < Until + 0.5f;
+        }
+
+        private void Load(HoldState hs) { clientIdx = hs.Idx; clientUntil = hs.Until; clientHeld = hs.Held; Puppet = hs.Puppet; lastLoggedHold = hs.LastLogged; }
+        private void Save(HoldState hs) { hs.Idx = clientIdx; hs.Until = clientUntil; hs.Held = clientHeld; hs.LastLogged = lastLoggedHold; }
+
+        /// <summary>Host: a player carries / dropped an item.</summary>
+        public void ReadHold(BinaryReader r, HoldState hs)
+        {
+            Load(hs);
+            try { ReadHoldInner(r); }
+            finally { Save(hs); }
+        }
+
+        private void ReadHoldInner(BinaryReader r)
         {
             string key = r.ReadString();
             string name = r.ReadString();
@@ -406,10 +476,11 @@ namespace FarCoopMod
             }
             var e = local[idx];
             if (e.Gone || !GameAccess.Alive(e.Item)) { WarnOnce("Partner carries an item that no longer exists here: " + key); return; }
-            if (held && lastLoggedHold != key) { lastLoggedHold = key; FarCoopPlugin.Logger.LogInfo("Partner picked up " + key); }
-            if (!held && lastLoggedHold == key) { lastLoggedHold = null; FarCoopPlugin.Logger.LogInfo("Partner dropped " + key); }
+            if (held && lastLoggedHold != key) { lastLoggedHold = key; FarCoopPlugin.Logger.LogInfo("Partner picked up " + key); Telemetry.Event("partner took " + name); }
+            if (!held && lastLoggedHold == key) { lastLoggedHold = null; FarCoopPlugin.Logger.LogInfo("Partner dropped " + key); Telemetry.Event("partner dropped " + name); }
 
             bool wasHeld = clientIdx == idx && clientHeld && Time.unscaledTime < clientUntil;
+            if (clientIdx >= 0 && clientIdx != idx) PuppetRelease(local[clientIdx], null, Vector3.zero);
             clientIdx = idx;
             clientUntil = Time.unscaledTime + 0.6f;
             clientHeld = held;
@@ -418,12 +489,15 @@ namespace FarCoopMod
             {
                 if (held)
                 {
+                    // best: the partner's body copy really takes the item, so the game itself
+                    // handles parenting, colliders and the vehicle's physics-parent system
+                    if (PuppetTake(e)) return;
+
                     try { e.Item.SetTaken(true); } catch { }
                     if (rb != null)
                     {
                         if (!originalKinematic.ContainsKey(rb.Pointer)) originalKinematic[rb.Pointer] = rb.isKinematic;
                         rb.isKinematic = true;
-                        // set both: FAR items have a separate interpolated visual that ignores MovePosition
                         rb.position = pos; rb.rotation = rot;
                         e.Item.transform.position = pos; e.Item.transform.rotation = rot;
                     }
@@ -431,29 +505,124 @@ namespace FarCoopMod
                 }
                 else
                 {
+                    if (PuppetRelease(e, (Vector3?)pos, vel)) { lastDropPos = pos; return; }
                     if (wasHeld || (rb != null && originalKinematic.ContainsKey(rb.Pointer)))
                     {
                         try { e.Item.SetTaken(false); } catch { }
+                        try { e.Item.EnablePhysics(true, null); } catch { }
                         if (rb != null)
                         {
                             originalKinematic.Remove(rb.Pointer);
                             rb.position = pos; rb.rotation = rot;
                             e.Item.transform.position = pos; e.Item.transform.rotation = rot;
-                            rb.isKinematic = false;           // dropped items always fall
+                            rb.isKinematic = false;
                             rb.detectCollisions = true;
                             rb.WakeUp();
                             rb.velocity = vel;
                         }
                     }
-                    else if (rb != null && !rb.isKinematic && (rb.position - pos).sqrMagnitude > 0.25f)
-                    {
-                        // keep the dropped item where the client sees it while it settles
-                        rb.position = pos; rb.rotation = rot; rb.velocity = vel;
-                    }
                 }
             }
             catch { }
         }
+
+        /// <summary>Host: partner body copy (set by the session every frame).</summary>
+        public Character Puppet;
+        private Vector3 lastDropPos;
+
+        private bool PuppetTake(Entry e)
+        {
+            var pc = Puppet;
+            if (pc == null || !GameAccess.Alive(pc)) return false;
+            try
+            {
+                var cur = pc.GetHoldingItem();
+                if (cur != null && cur.Pointer == e.Item.Pointer) return true;       // already in hand
+                var me = GameAccess.LocalCharacter;
+                var mine = me != null ? me.GetHoldingItem() : null;
+                if (mine != null && mine.Pointer == e.Item.Pointer) return true;      // host holds it: ignore
+                if (cur != null) { PartnerInput.AllowPuppetTake = true; try { pc.ReleaseItem(cur); } finally { PartnerInput.AllowPuppetTake = false; } }
+                PartnerInput.AllowPuppetTake = true;
+                try { pc.TakeItem(e.Item); } finally { PartnerInput.AllowPuppetTake = false; }
+                cur = pc.GetHoldingItem();
+                bool ok = cur != null && cur.Pointer == e.Item.Pointer;
+                if (ok) FarCoopPlugin.Logger.LogInfo("Partner body took " + e.Key);
+                return ok;
+            }
+            catch (Exception ex) { FarCoopPlugin.Logger.LogDebug("PuppetTake: " + ex.Message); PartnerInput.AllowPuppetTake = false; return false; }
+        }
+
+        /// <summary>Puppet drops the item (if it holds it). Optionally place it where the partner dropped it.</summary>
+        private bool PuppetRelease(Entry e, Vector3? pos, Vector3 vel)
+        {
+            var pc = Puppet;
+            if (pc == null || !GameAccess.Alive(pc) || e == null || !GameAccess.Alive(e.Item)) return false;
+            try
+            {
+                var cur = pc.GetHoldingItem();
+                if (cur == null || cur.Pointer != e.Item.Pointer) return false;
+                PartnerInput.AllowPuppetTake = true;
+                try { pc.ReleaseItem(cur); } finally { PartnerInput.AllowPuppetTake = false; }
+                var rb = e.Body;
+                if (pos.HasValue && rb != null && !rb.isKinematic)
+                {
+                    if ((rb.position - pos.Value).sqrMagnitude < 4f) { rb.position = pos.Value; e.Item.transform.position = pos.Value; }
+                    rb.velocity = vel;
+                }
+                FarCoopPlugin.Logger.LogInfo("Partner body dropped " + e.Key);
+                return true;
+            }
+            catch (Exception ex) { FarCoopPlugin.Logger.LogDebug("PuppetRelease: " + ex.Message); PartnerInput.AllowPuppetTake = false; return false; }
+        }
+
+        /// <summary>
+        /// Host: if the partner stops reporting an item they held (put it in the burner, disconnected,
+        /// lag), give it back to physics - otherwise it hangs frozen in the air ("flying box").
+        /// </summary>
+        /// <summary>Host: a player left - their body copy drops whatever it carried.</summary>
+        public void ReleaseHolder(HoldState hs)
+        {
+            Load(hs);
+            if (clientIdx >= 0 && clientIdx < local.Count) PuppetRelease(local[clientIdx], null, Vector3.zero);
+            if (Puppet != null && GameAccess.Alive(Puppet))
+            {
+                try { var it = Puppet.GetHoldingItem(); if (it != null) { PartnerInput.AllowPuppetTake = true; try { Puppet.ReleaseItem(it); } finally { PartnerInput.AllowPuppetTake = false; } } } catch { }
+            }
+            hs.Idx = -1; hs.Held = false;
+            nextHostTick = 0f;   // next HostTick gives frozen (kinematic) items back to physics
+        }
+
+        public void HostTick(List<HoldState> holders)
+        {
+            if (Time.unscaledTime < nextHostTick) return;
+            nextHostTick = Time.unscaledTime + 0.25f;
+            var keep = new HashSet<int>();
+            foreach (var hs in holders)
+            {
+                if (hs.Active) { keep.Add(hs.Idx); continue; }
+                Load(hs);
+                if (clientIdx >= 0 && clientIdx < local.Count) PuppetRelease(local[clientIdx], null, Vector3.zero);
+                if (Puppet != null && GameAccess.Alive(Puppet))
+                {
+                    // a partner's body copy must never keep something that partner no longer holds
+                    try { var it = Puppet.GetHoldingItem(); if (it != null) { PartnerInput.AllowPuppetTake = true; try { Puppet.ReleaseItem(it); } finally { PartnerInput.AllowPuppetTake = false; } } } catch { }
+                }
+                hs.Idx = -1;
+            }
+            for (int i = 0; i < local.Count; i++)
+            {
+                if (keep.Contains(i)) continue;     // still really in someone's hands
+                var e = local[i];
+                var rb = e.Body;
+                if (rb == null || !originalKinematic.ContainsKey(rb.Pointer)) continue;
+                originalKinematic.Remove(rb.Pointer);
+                if (e.Gone || !GameAccess.Alive(e.Item)) continue;
+                try { e.Item.SetTaken(false); } catch { }
+                try { rb.isKinematic = false; rb.detectCollisions = true; rb.WakeUp(); } catch { }
+                FarCoopPlugin.Logger.LogInfo("Released item a partner stopped holding: " + e.Key);
+            }
+        }
+        private float nextHostTick;
 
         private string lastLoggedHold;
         private readonly Dictionary<string, int> aliases = new Dictionary<string, int>();
@@ -484,6 +653,8 @@ namespace FarCoopMod
             hostKeys.Clear();
             hostToLocal = new int[0];
             snaps = new Snap[0];
+            bufs = new PoseBuffer[0];
+            bufLocal = new bool[0];
             Mapped = 0;
         }
     }

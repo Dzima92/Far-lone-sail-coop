@@ -60,7 +60,7 @@ namespace FarCoopMod
         {
             get
             {
-                if (Alive(cachedCharacter) && cachedCharacter.Pointer != PartnerInput.PuppetCharacter) return cachedCharacter;
+                if (Alive(cachedCharacter) && !PartnerInput.IsPuppet(cachedCharacter.Pointer)) return cachedCharacter;
                 cachedCharacter = null;
                 if (Time.unscaledTime < nextCharacterSearch) return null;
                 nextCharacterSearch = Time.unscaledTime + 1f;
@@ -70,7 +70,8 @@ namespace FarCoopMod
                     for (int i = 0; i < all.Length; i++)
                     {
                         var c = all[i]?.TryCast<Character>();
-                        if (c == null || c.Pointer == PartnerInput.PuppetCharacter) continue;
+                        if (c == null || PartnerInput.IsPuppet(c.Pointer)) continue;
+                        try { if (c.gameObject.name.StartsWith("FarCoop_")) continue; } catch { }
                         cachedCharacter = c;
                         break;
                     }
