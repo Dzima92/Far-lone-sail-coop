@@ -76,16 +76,27 @@ namespace FarCoopMod.Net
         {
             try
             {
-                var header = new byte[4];
-                foreach (var frame in sendQueue.GetConsumingEnumerable())
+                // everything queued since the last write goes out in ONE socket write (one TCP packet
+                // when it fits) instead of two writes per message
+                var batch = new MemoryStream(16 * 1024);
+                while (!Closed)
                 {
-                    int len = frame.Length;
-                    header[0] = (byte)len; header[1] = (byte)(len >> 8);
-                    header[2] = (byte)(len >> 16); header[3] = (byte)(len >> 24);
-                    stream.Write(header, 0, 4);
-                    stream.Write(frame, 0, len);
-                    Interlocked.Add(ref BytesOut, len + 4);
-                    Interlocked.Increment(ref FramesOut);
+                    byte[] frame;
+                    try { frame = sendQueue.Take(); }
+                    catch (InvalidOperationException) { break; }   // CompleteAdding
+                    batch.SetLength(0);
+                    int frames = 0;
+                    do
+                    {
+                        int len = frame.Length;
+                        batch.WriteByte((byte)len); batch.WriteByte((byte)(len >> 8));
+                        batch.WriteByte((byte)(len >> 16)); batch.WriteByte((byte)(len >> 24));
+                        batch.Write(frame, 0, len);
+                        frames++;
+                    } while (batch.Length < 60 * 1024 && sendQueue.TryTake(out frame));
+                    stream.Write(batch.GetBuffer(), 0, (int)batch.Length);
+                    Interlocked.Add(ref BytesOut, batch.Length);
+                    Interlocked.Add(ref FramesOut, frames);
                 }
             }
             catch (Exception e) { Close("send: " + e.GetType().Name + " " + e.Message); }

@@ -12,13 +12,6 @@ namespace FarCoopMod
     /// </summary>
     public sealed class VehicleSync
     {
-        private struct Snapshot
-        {
-            public bool Valid;
-            public Vector3 Pos, Vel, AngVel;
-            public Quaternion Rot;
-        }
-
         public GameObject Root { get; private set; }
         public readonly List<Rigidbody> Bodies = new List<Rigidbody>();
         public readonly List<string> Paths = new List<string>();
@@ -30,7 +23,6 @@ namespace FarCoopMod
         // client side
         private List<string> hostPaths = new List<string>();
         private int[] hostToLocal = new int[0];
-        private Snapshot[] snapshots = new Snapshot[0];
         private float snapshotTime;
         private readonly Dictionary<IntPtr, bool> originalKinematic = new Dictionary<IntPtr, bool>();
         public int MappedCount { get; private set; }
@@ -148,6 +140,7 @@ namespace FarCoopMod
             }
 
             var w = Proto.Begin(MsgType.VehicleState, out var ms);
+            w.Write(Time.realtimeSinceStartup);          // host clock: the client interpolates on it
             w.Write((ushort)idx.Count);
             foreach (int i in idx)
             {
@@ -156,9 +149,8 @@ namespace FarCoopMod
                 sentPos[i] = p; sentRot[i] = q;
                 w.Write((ushort)i);
                 w.Write(p);
-                w.Write(q);
+                w.WriteQuatC(q);
                 w.Write(rb.velocity);
-                w.Write(rb.angularVelocity);
             }
             w.Write(Energy);
             return Proto.End(w, ms);
@@ -171,25 +163,30 @@ namespace FarCoopMod
             int n = r.ReadUInt16();
             hostPaths = new List<string>(n);
             for (int i = 0; i < n; i++) hostPaths.Add(r.ReadString());
-            snapshots = new Snapshot[n];
+            buffers = new PoseBuffer[n];
+            for (int i = 0; i < n; i++) buffers[i] = new PoseBuffer();
             RebuildMapping();
         }
 
+        private PoseBuffer[] buffers = new PoseBuffer[0];
+
+        /// <summary>Client: the chassis pose this physics step (items in the vehicle are placed on it).</summary>
+        public Vector3 FramePos;
+        public Quaternion FrameRot = Quaternion.identity;
+        public bool HasFramePose;
+
         public void ReadStateMessage(BinaryReader r)
         {
+            float t = r.ReadSingle();
+            NetClock.OnHostTime(t);
             int n = r.ReadUInt16();
             for (int k = 0; k < n; k++)
             {
                 int i = r.ReadUInt16();
-                var s = new Snapshot
-                {
-                    Valid = true,
-                    Pos = r.ReadVector3(),
-                    Rot = r.ReadQuaternion(),
-                    Vel = r.ReadVector3(),
-                    AngVel = r.ReadVector3(),
-                };
-                if (i < snapshots.Length) snapshots[i] = s;
+                Vector3 pos = r.ReadVector3();
+                Quaternion rot = r.ReadQuatC();
+                Vector3 vel = r.ReadVector3();
+                if (i < buffers.Length) buffers[i].Add(t, pos, rot, vel);
             }
             snapshotTime = Time.time;
             if (r.BaseStream.Position + 4 <= r.BaseStream.Length) Energy = r.ReadSingle();
@@ -210,16 +207,17 @@ namespace FarCoopMod
                 FarCoopPlugin.Logger.LogInfo($"Vehicle mapping: {MappedCount}/{hostPaths.Count} host bodies matched locally");
         }
 
-        /// <summary>Client: call from FixedUpdate.</summary>
+        /// <summary>Client: call from FixedUpdate. Shows the host's vehicle slightly in the past,
+        /// blended between two received snapshots (smooth even when packets arrive unevenly).</summary>
         public void ApplySnapshots()
         {
             if (!HasSnapshot) return;
-            float age = Mathf.Clamp(Time.time - snapshotTime, 0f, 0.25f);
+            float rt = NetClock.RenderTime;
 
             for (int h = 0; h < hostToLocal.Length; h++)
             {
                 int li = hostToLocal[h];
-                if (li < 0 || li >= Bodies.Count || h >= snapshots.Length || !snapshots[h].Valid) continue;
+                if (li < 0 || li >= Bodies.Count || h >= buffers.Length || !buffers[h].HasData) continue;
                 var rb = Bodies[li];
                 if (!GameAccess.Alive(rb)) continue;
 
@@ -235,14 +233,9 @@ namespace FarCoopMod
                         originalKinematic[rb.Pointer] = true;
                     }
 
-                    var s = snapshots[h];
-                    Vector3 target = s.Pos + s.Vel * age;
-                    Quaternion targetRot = s.Rot;
-                    float angSpeed = s.AngVel.magnitude;
-                    if (angSpeed > 0.001f)
-                        targetRot = Quaternion.AngleAxis(angSpeed * age * Mathf.Rad2Deg, s.AngVel / angSpeed) * s.Rot;
-
-                    if ((rb.position - target).sqrMagnitude > 9f)
+                    if (!buffers[h].Sample(rt, out Vector3 target, out Quaternion targetRot)) continue;
+                    Vector3 oldPos = rb.position; Quaternion oldRot = rb.rotation;
+                    if ((oldPos - target).sqrMagnitude > 9f)
                     {
                         rb.position = target;
                         rb.rotation = targetRot;
@@ -251,9 +244,70 @@ namespace FarCoopMod
                     }
                     else
                     {
-                        rb.MovePosition(Vector3.Lerp(rb.position, target, 0.5f));
-                        rb.MoveRotation(Quaternion.Slerp(rb.rotation, targetRot, 0.5f));
+                        rb.MovePosition(target);
+                        rb.MoveRotation(targetRot);
                     }
+                    if (rb == Chassis)
+                    {
+                        FramePos = target; FrameRot = targetRot; HasFramePose = true;
+                        CarryRiders(oldPos, oldRot, target, targetRot);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>A body standing in the vehicle; Idle = its player presses no left/right/jump.</summary>
+        public struct Rider { public Rigidbody Body; public bool Idle; }
+
+        /// <summary>Client: bodies standing in the vehicle (set every FixedUpdate).</summary>
+        public readonly List<Rider> Riders = new List<Rider>();
+        private readonly Dictionary<IntPtr, Vector3> anchors = new Dictionary<IntPtr, Vector3>();
+        // how much the game itself pushes a rider along per metre the vehicle moves (learned while idle)
+        private readonly Dictionary<IntPtr, float> pushRatio = new Dictionary<IntPtr, float>();
+        private float lastChassisStepX;
+
+        /// <summary>
+        /// The client's vehicle is moved by the mod, so the game's own "ride along" only partly works
+        /// there. Telemetry showed players drifting forward ~0.8 m/s and jittering against walls with
+        /// no key pressed. Riders are now carried rigidly with the vehicle, and while their player
+        /// presses nothing, their spot in the vehicle is held (any drift along the vehicle cancelled).
+        /// </summary>
+        private void CarryRiders(Vector3 oldPos, Quaternion oldRot, Vector3 newPos, Quaternion newRot)
+        {
+            if (Riders.Count == 0) { anchors.Clear(); return; }
+            Quaternion inv = Quaternion.Inverse(oldRot);
+            float stepX = lastChassisStepX;                       // what the game reacted to during the last physics step
+            lastChassisStepX = (inv * (newPos - oldPos)).x;       // vehicle movement along itself this step
+            foreach (var r in Riders)
+            {
+                var rb = r.Body;
+                if (!GameAccess.Alive(rb)) continue;
+                try
+                {
+                    Vector3 cur = rb.position;
+                    Vector3 local = inv * (cur - oldPos);
+                    pushRatio.TryGetValue(rb.Pointer, out float k);
+                    if (anchors.TryGetValue(rb.Pointer, out Vector3 a) && Mathf.Abs(local.x - a.x) < 0.5f)
+                    {
+                        float drift = local.x - a.x;
+                        if (r.Idle)
+                        {
+                            // learn the game's own extra push, then cancel it
+                            if (Mathf.Abs(stepX) > 0.002f) pushRatio[rb.Pointer] = Mathf.Clamp(Mathf.Lerp(k, drift / stepX, 0.05f), -2f, 2f);
+                            local.x = a.x;   // standing still: no sliding along the vehicle
+                        }
+                        else
+                        {
+                            // walking: remove only the game's extra push, so left and right walk at the same speed
+                            local.x -= k * stepX;
+                        }
+                    }
+                    anchors[rb.Pointer] = local;
+                    Vector3 p = newPos + newRot * local;
+                    p.z = cur.z;          // side view: never out of the depth plane
+                    rb.position = p;
+                    rb.transform.position = p;
                 }
                 catch { }
             }
@@ -276,7 +330,10 @@ namespace FarCoopMod
             snapshotTime = 0f;
             hostPaths.Clear();
             hostToLocal = new int[0];
-            snapshots = new Snapshot[0];
+            buffers = new PoseBuffer[0];
+            HasFramePose = false;
+            anchors.Clear(); pushRatio.Clear(); lastChassisStepX = 0f;
+            NetClock.Reset();
             MappedCount = 0;
         }
     }

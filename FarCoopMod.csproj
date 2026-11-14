@@ -14,10 +14,10 @@
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
     <!-- Game install used for references and auto-deploy -->
-    <GameDir>E:\Games\FarLoneSails - coop</GameDir>
-    <!-- Optional: a second PC's plugins folder (network share) to copy the DLL to.
-         Set it in FarCoopMod.csproj.user (not committed), e.g. <PartnerPluginsDir>\\PC2\share\BepInEx\plugins</PartnerPluginsDir> -->
-    <PartnerPluginsDir Condition="'$(PartnerPluginsDir)' == ''"></PartnerPluginsDir>
+    <GamesRoot>E:\Games\Far Lone Sails</GamesRoot>
+    <GameDir>$(GamesRoot)\FarLoneSails - coop</GameDir>
+    <!-- Second PC (network share). Copy is skipped with a warning if unreachable. -->
+    <PartnerPluginsDir>\\DESKTOP-ADAM\Users\adam.DESKTOP-ADAM\Desktop\FarLoneSails - coop\BepInEx\plugins</PartnerPluginsDir>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -144,18 +144,28 @@
     <Compile Include="RemoteAvatar.cs" />
     <Compile Include="ButtonSync.cs" />
     <Compile Include="ItemSync.cs" />
+    <Compile Include="HoseSync.cs" />
+    <Compile Include="CoverSync.cs" />
+    <Compile Include="Telemetry.cs" />
     <Compile Include="PartnerInput.cs" />
     <Compile Include="PartnerPuppet.cs" />
     <Compile Include="Net\Connection.cs" />
     <Compile Include="Net\CoopNet.cs" />
     <Compile Include="Net\Protocol.cs" />
+    <Compile Include="Net\NetClock.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- Auto-deploy: copies the built DLL into this PC's plugins folder and the partner PC's share.
        If the game is running the DLL is locked: close the game and build again. -->
+  <!-- Copies the mod into EVERY game folder under $(GamesRoot) that has BepInEx\plugins, plus Adam's PC. -->
   <Target Name="AfterBuild">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\BepInEx\plugins" ContinueOnError="true" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PartnerPluginsDir)" ContinueOnError="true" Condition="'$(PartnerPluginsDir)' != ''" />
+    <ItemGroup>
+      <CoopGame Include="$([System.IO.Directory]::GetDirectories('$(GamesRoot)'))" />
+      <CoopPlugins Include="%(CoopGame.FullPath)\BepInEx\plugins" Condition="Exists('%(CoopGame.FullPath)\BepInEx\plugins')" />
+    </ItemGroup>
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="%(CoopPlugins.Identity)" ContinueOnError="true" />
+    <Message Importance="high" Text="FarCoopMod.dll -> %(CoopPlugins.Identity)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PartnerPluginsDir)" ContinueOnError="true" Retries="0" Condition="'$(PartnerPluginsDir)' != ''" />
   </Target>
 </Project>

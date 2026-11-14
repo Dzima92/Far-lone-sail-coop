@@ -27,7 +27,12 @@ namespace FarCoopMod.Net
         private const string DiscoverReply = "FARCOOP_HOST_V2";
 
         public NetRole Role { get; private set; } = NetRole.None;
+        /// <summary>Client: the connection to the host.</summary>
         public Connection Peer { get; private set; }
+        /// <summary>Host: every connected player.</summary>
+        public readonly List<Connection> Peers = new List<Connection>();
+        /// <summary>Host: how many players may join (besides the host).</summary>
+        public int MaxClients = 3;
         public bool Searching => Volatile.Read(ref searching) != 0;
         public bool Connecting => Volatile.Read(ref connecting) != 0;
 
@@ -203,29 +208,44 @@ namespace FarCoopMod.Net
 
         // ---------------- main thread ----------------
 
-        /// <summary>Call from Unity main thread. Returns a newly established peer connection, if any.</summary>
-        public Connection PollNewPeer()
+        /// <summary>Call from Unity main thread. Returns newly established connections.</summary>
+        public List<Connection> PollNewPeers()
         {
-            Connection newPeer = null;
+            var result = new List<Connection>();
             while (pendingConnections.TryDequeue(out var c))
             {
-                if (Peer != null && !Peer.Closed)
+                if (Role == NetRole.Host)
                 {
-                    c.Close("busy");
-                    Events.Enqueue("Rejected extra connection from " + c.RemoteAddress + " (only 1 partner supported).");
-                    continue;
+                    Peers.RemoveAll(p => p.Closed);
+                    if (Peers.Count >= MaxClients)
+                    {
+                        c.Close("server full");
+                        Events.Enqueue($"Rejected connection from {c.RemoteAddress} (server full: {MaxClients} players).");
+                        continue;
+                    }
+                    Peers.Add(c);
+                    result.Add(c);
                 }
-                Peer = c;
-                newPeer = c;
+                else
+                {
+                    if (Peer != null && !Peer.Closed) { c.Close("busy"); continue; }
+                    Peer = c;
+                    result.Add(c);
+                }
             }
-            return newPeer;
+            return result;
         }
 
-        public void DropPeer(string reason)
+        public void DropPeer(Connection c, string reason)
         {
-            Peer?.Close(reason);
-            Peer = null;
-            if (Role == NetRole.Client) Role = NetRole.None;
+            if (c == null) return;
+            c.Close(reason);
+            Peers.Remove(c);
+            if (c == Peer)
+            {
+                Peer = null;
+                if (Role == NetRole.Client) Role = NetRole.None;
+            }
         }
 
         public void StopAll(string reason)
@@ -237,6 +257,8 @@ namespace FarCoopMod.Net
             discoveryResponder = null;
             Peer?.Close(reason);
             Peer = null;
+            foreach (var c in Peers) c.Close(reason);
+            Peers.Clear();
             Role = NetRole.None;
         }
 

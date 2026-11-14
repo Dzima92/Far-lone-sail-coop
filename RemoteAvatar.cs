@@ -265,6 +265,10 @@ namespace FarCoopMod
         /// <summary>Hide/show the visual-only avatar (hidden on the host while the real puppet exists).</summary>
         public bool Suppressed { get; set; }
 
+        private Vector3 smoothedLocal;
+        private Quaternion smoothedLocalRot = Quaternion.identity;
+        private bool smoothedInside;
+
         public void Update(VehicleSync vehicle, float dt)
         {
             if (!hasTarget) return;
@@ -289,21 +293,48 @@ namespace FarCoopMod
             // FAR's visual body is interpolated separately and can report odd positions:
             // stand the avatar on the partner's physics root instead.
             var t = root.transform;
+            var frameT = targetInside ? vehicle.Frame : null;
             var rootWorld = PartnerRootWorld(vehicle);
             if (rootWorld.HasValue)
             {
                 float ahead = Mathf.Clamp(Time.time - LastUpdateTime, 0f, 0.1f);
+                // walking speed is measured in the vehicle's frame while inside it
+                Vector3 vel = frameT != null ? frameT.TransformVector(rootVelocity) : rootVelocity;
                 // FAR's model is skinned far away from its own transform: align the MESH CENTER of
                 // the copy with where the mesh sits on a real character (root + meshOffset).
                 UpdateAlignment();
-                Vector3 desiredCenter = rootWorld.Value + meshOffset + rootVelocity * ahead;
+                Vector3 desiredCenter = rootWorld.Value + meshOffset + vel * ahead;
                 worldPos = desiredCenter - t.rotation * cloneCenterLocal;
             }
 
             float k = 1f - Mathf.Exp(-25f * dt);
-            if ((t.position - worldPos).sqrMagnitude > 25f) t.position = worldPos;
-            else t.position = Vector3.Lerp(t.position, worldPos, k);
-            t.rotation = Quaternion.Slerp(t.rotation, worldRot, k);
+            if (frameT != null)
+            {
+                // smooth in the vehicle's own space: the avatar rides along exactly with the
+                // vehicle instead of trailing behind it (that looked like sliding)
+                Vector3 localTarget = frameT.InverseTransformPoint(worldPos);
+                Quaternion localRotTarget = Quaternion.Inverse(frameT.rotation) * worldRot;
+                if (!smoothedInside || (smoothedLocal - localTarget).sqrMagnitude > 25f)
+                {
+                    smoothedLocal = localTarget; smoothedLocalRot = localRotTarget; smoothedInside = true;
+                }
+                else
+                {
+                    smoothedLocal = Vector3.Lerp(smoothedLocal, localTarget, k);
+                    smoothedLocalRot = Quaternion.Slerp(smoothedLocalRot, localRotTarget, k);
+                }
+                Vector3 sp = frameT.TransformPoint(smoothedLocal);
+                sp.z = worldPos.z;   // FAR is a side view: never let smoothing push the body out of its depth plane
+                t.position = sp;
+                t.rotation = frameT.rotation * smoothedLocalRot;
+            }
+            else
+            {
+                smoothedInside = false;
+                if ((t.position - worldPos).sqrMagnitude > 25f) t.position = worldPos;
+                else t.position = Vector3.Lerp(t.position, worldPos, k);
+                t.rotation = Quaternion.Slerp(t.rotation, worldRot, k);
+            }
             if (model != null && !isCapsule) model.localScale = targetScale;
 
             // hide the avatar if the partner stopped sending (menu, loading)

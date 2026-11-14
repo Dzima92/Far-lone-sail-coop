@@ -23,6 +23,9 @@ namespace FarCoopMod
         };
 
         public Character Character { get; private set; }
+        /// <summary>Input of the player this body belongs to.</summary>
+        public readonly PuppetSlot Slot = new PuppetSlot();
+        private static readonly List<PartnerPuppet> all = new List<PartnerPuppet>();
         private Rigidbody body;
         private float nextBuildAttempt;
         private int failures;
@@ -178,11 +181,11 @@ namespace FarCoopMod
         }
 
         /// <summary>Players do not bump into each other (the puppet still touches the world and buttons).</summary>
-        private static void IgnorePlayerCollisions(Character local, GameObject puppet)
+        private static void IgnorePlayerCollisions(GameObject local, GameObject puppet)
         {
             try
             {
-                var a = local.gameObject.GetComponentsInChildren(Il2CppType.Of<Collider>(), true);
+                var a = local.GetComponentsInChildren(Il2CppType.Of<Collider>(), true);
                 var b = puppet.GetComponentsInChildren(Il2CppType.Of<Collider>(), true);
                 int n = 0;
                 for (int i = 0; i < a.Length; i++)
@@ -269,9 +272,11 @@ namespace FarCoopMod
                 var motor = GameAccess.GetCompInChildren<Okomotive.SideScrollerCharacterController.CharacterMotor>(clone);
 
                 // register before activation so its very first Update already uses partner input
-                PartnerInput.PuppetCharacter = ch.Pointer;
-                PartnerInput.PuppetInput = input != null ? input.Pointer : IntPtr.Zero;
-                PartnerInput.PuppetMotor = motor != null ? motor.Pointer : IntPtr.Zero;
+                Slot.Character = ch.Pointer;
+                Slot.Input = input != null ? input.Pointer : IntPtr.Zero;
+                Slot.Motor = motor != null ? motor.Pointer : IntPtr.Zero;
+                Slot.CountersInit = false;
+                PartnerInput.Register(Slot);
 
                 DetachSharedReferences(local, ch, motor, clone);
 
@@ -296,7 +301,10 @@ namespace FarCoopMod
                 clone.transform.SetParent(null, true);   // becomes active -> Awake/Start
                 Character = ch;
                 everBuilt = true;
-                IgnorePlayerCollisions(local, clone);
+                IgnorePlayerCollisions(local.gameObject, clone);
+                foreach (var other in all)
+                    if (other != this && other.Exists) IgnorePlayerCollisions(other.Character.gameObject, clone);
+                if (!all.Contains(this)) all.Add(this);
                 body = GameAccess.CharacterBody(ch);
                 FarCoopPlugin.Logger.LogInfo($"Partner puppet created (input:{input != null}, motor:{motor != null}, body:{body != null})");
             }
@@ -312,13 +320,25 @@ namespace FarCoopMod
             }
         }
 
-        /// <summary>Pull the puppet toward where the partner really is (call in FixedUpdate).</summary>
+        /// <summary>
+        /// Pull the puppet toward where the partner really is (call in FixedUpdate).
+        /// The puppet walks with the partner's own input, so it normally stays close by itself.
+        /// Small differences are left alone: correcting them fought the puppet while it pushed a
+        /// button (the partner's own copy of the button only moves later, so the partner looks
+        /// "stuck" in front of it and the puppet kept being pulled back -> button never pressed).
+        /// </summary>
         public void Correct(Vector3 target)
         {
             if (!Exists) return;
             try
             {
                 Vector3 pos = body != null ? body.position : Character.transform.position;
+                if (Mathf.Abs(pos.z - target.z) > 0.05f)
+                {
+                    // depth (side-view plane) is always taken exactly
+                    pos.z = target.z;
+                    if (body != null) body.position = pos; else Character.transform.position = pos;
+                }
                 Vector3 delta = target - pos;
                 float d = delta.magnitude;
                 if (d > 2.5f)
@@ -326,9 +346,10 @@ namespace FarCoopMod
                     if (body != null) { body.velocity = Vector3.zero; body.position = target; }
                     Character.transform.position = target;
                 }
-                else if (d > 0.05f)
+                else if (d > 0.35f)
                 {
-                    Vector3 step = delta * 0.35f;
+                    // only the part beyond the dead zone, gently
+                    Vector3 step = delta * ((d - 0.35f) / d) * 0.2f;
                     if (body != null) body.position = pos + step;
                     else Character.transform.position = pos + step;
                 }
@@ -338,7 +359,9 @@ namespace FarCoopMod
 
         public void Destroy()
         {
-            PartnerInput.Clear();
+            PartnerInput.Unregister(Slot);
+            Slot.Character = Slot.Input = Slot.Motor = IntPtr.Zero;
+            all.Remove(this);
             if (GameAccess.Alive(Character))
             {
                 try { UnityEngine.Object.Destroy(Character.gameObject); } catch { }

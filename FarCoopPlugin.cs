@@ -15,8 +15,8 @@ namespace FarCoopMod
     public class FarCoopPlugin : BasePlugin
     {
         public const string Guid = "com.dima.farlonesailscoop";
-        public const string Version = "3.3.2";
-        public const int ProtocolVersion = 3;
+        public const string Version = "4.2.2";
+        public const int ProtocolVersion = 5;
 
         internal static ManualLogSource Logger;
         internal static Harmony HarmonyInstance;
@@ -31,7 +31,9 @@ namespace FarCoopMod
         internal static ConfigEntry<bool> CfgClientPuppet;
         internal static ConfigEntry<bool> CfgAutoResume;
         internal static ConfigEntry<bool> CfgDebugLog;
+        internal static ConfigEntry<bool> CfgTelemetry;
         internal static ConfigEntry<string> CfgRecentServers;
+        internal static ConfigEntry<int> CfgMaxPlayers;
 
         public override void Load()
         {
@@ -45,7 +47,9 @@ namespace FarCoopMod
             CfgClientPuppet = Config.Bind("Sync", "PartnerBody", true, "Host spawns a real character for the partner so they can drive the vehicle, carry boxes and fuel.");
             CfgSendRate = Config.Bind("Sync", "SendRateHz", 20, "State packets per second.");
             CfgAutoResume = Config.Bind("UI", "AutoResumeOnStart", true, "Skip the RESUME menu once when the game starts.");
+            CfgMaxPlayers = Config.Bind("Network", "MaxPlayers", 4, "Players in one game, host included (a dedicated server does not count). 2-16.");
             CfgRecentServers = Config.Bind("Network", "RecentServers", "", "Last joined servers (IP:port separated by |), shown in the server list.");
+            CfgTelemetry = Config.Bind("Debug", "Telemetry", true, "Write one line per second to BepInEx\\FarCoop-telemetry.log: keys pressed/held, sliding, positions, network, other players, events.");
             CfgDebugLog = Config.Bind("Debug", "PositionLog", false, "Write position diagnostics to LogOutput.log every 5 s.");
             CfgShowHud = Config.Bind("UI", "ShowHud", true, "Show the co-op HUD on start (toggle with F4).");
 
@@ -54,6 +58,8 @@ namespace FarCoopMod
             HarmonyInstance = new Harmony(Guid);
             ButtonSync.Install(HarmonyInstance);
             PartnerInput.Install(HarmonyInstance);
+            HoseSync.Install(HarmonyInstance);
+            CoverSync.Install(HarmonyInstance);
 
             SceneManager.add_sceneLoaded((UnityAction<Scene, LoadSceneMode>)((scene, mode) =>
             {
